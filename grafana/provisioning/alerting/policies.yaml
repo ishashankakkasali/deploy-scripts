@@ -1,0 +1,19 @@
+apiVersion: 1
+
+# Root notification policy. Default (catch-all) receiver is the no-op — any alert not
+# explicitly matched by a nested route below produces no notification. Only the RI-63
+# "No Data Ingestion for 4+ Hours" alert is routed to email; the other 4 pre-existing
+# rules (CDC slot/lag, ClickHouse disk, insert-stall) stay silent for now.
+policies:
+  - orgId: 1
+    receiver: no-op
+    group_by: ['alertname']
+    routes:
+      - receiver: cce-email-alerts
+        object_matchers:
+          - ['alertname', '=', 'No Data Ingestion for 4+ Hours']
+        group_by: ['alertname']
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+        continue: false

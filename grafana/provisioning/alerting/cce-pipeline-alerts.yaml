@@ -149,3 +149,43 @@ groups:
                   operator: { type: and }
                   query: { params: [C] }
                   reducer: { type: last, params: [] }
+
+      # ---- RI-63: no data ingestion at all for 4+ hours (business-level, 24/7) -------------
+      # Distinct from cce-clickhouse-insert-stall above: that one is a tight (10m) CDC-pipeline
+      # health check; this is the longer-window "is CCE receiving any clinical data at all"
+      # signal, using the same exact-gap-since-last-event definition as the Ingestion page's
+      # "Last Ingested Event" tile (dateDiff on max(received_at)), so the alert and the
+      # dashboard never disagree.
+      - uid: cce-ingestion-stalled-4h
+        title: No Data Ingestion for 4+ Hours
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "CCE has received no inbound clinical events for over 4 hours"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              datasource: { type: grafana-clickhouse-datasource, uid: clickhouse }
+              queryType: sql
+              rawSql: "SELECT dateDiff('hour', max(received_at), now()) AS value FROM cce_analytics.inbound_event_logs"
+          - refId: C
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [4] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }

@@ -63,6 +63,25 @@ spec:
               valueFrom: { secretKeyRef: { name: cce-secrets, key: POSTGRES_USER } }
             - name: POSTGRES_PASSWORD
               valueFrom: { secretKeyRef: { name: cce-secrets, key: POSTGRES_PASSWORD } }
+            # SMTP — required for Grafana Alerting's Email contact point (RI-63). Credentials must
+            # be provisioned into cce-secrets per-environment (never hardcoded here).
+            - name: GF_SMTP_ENABLED
+              value: "true"
+            - name: GF_SMTP_HOST
+              valueFrom: { secretKeyRef: { name: cce-secrets, key: GF_SMTP_HOST } }
+            - name: GF_SMTP_USER
+              valueFrom: { secretKeyRef: { name: cce-secrets, key: GF_SMTP_USER } }
+            - name: GF_SMTP_PASSWORD
+              valueFrom: { secretKeyRef: { name: cce-secrets, key: GF_SMTP_PASSWORD } }
+            - name: GF_SMTP_FROM_ADDRESS
+              valueFrom: { secretKeyRef: { name: cce-secrets, key: GF_SMTP_FROM_ADDRESS } }
+            - name: GF_SMTP_FROM_NAME
+              value: "CCE Grafana Alerts"
+            # Alert recipient — expanded into contactpoints.yaml's ${GF_ALERT_EMAIL_ADDRESS}
+            # placeholder by Grafana at load time (same mechanism as the datasource ${VAR}s
+            # above). Set per-environment in cce-secrets, not hardcoded in the YAML.
+            - name: GF_ALERT_EMAIL_ADDRESS
+              valueFrom: { secretKeyRef: { name: cce-secrets, key: GF_ALERT_EMAIL_ADDRESS } }
           volumeMounts:
             - name: grafana-data
               mountPath: /var/lib/grafana
@@ -74,6 +93,11 @@ spec:
             # step (rw/uat/03, rw/prod/05) with the datasource uid rewritten to "prometheus".
             - name: grafana-dashboards
               mountPath: /var/lib/grafana/dashboards
+            # Alerting rules + contact points + notification policy (RI-63). Created from
+            # grafana/provisioning/alerting/*.yaml by the deploy step (rw/uat/03, rw/prod/05),
+            # mirroring the grafana-dashboards pattern above.
+            - name: grafana-alerting-provisioning
+              mountPath: /etc/grafana/provisioning/alerting
           resources:
             requests:
               memory: 256Mi
@@ -94,6 +118,10 @@ spec:
         - name: grafana-dashboards
           configMap:
             name: grafana-dashboards
+            optional: true
+        - name: grafana-alerting-provisioning
+          configMap:
+            name: grafana-alerting-provisioning
             optional: true
 ---
 apiVersion: v1

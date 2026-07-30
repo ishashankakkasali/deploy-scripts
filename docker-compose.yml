@@ -270,12 +270,23 @@ services:
       GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
       POSTGRES_READ_ONLY_PASSWORD: ${POSTGRES_READ_ONLY_PASSWORD:?set POSTGRES_READ_ONLY_PASSWORD in .env}
+      # SMTP — required for Grafana Alerting's Email contact point (RI-63)
+      GF_SMTP_ENABLED: ${GF_SMTP_ENABLED:-false}
+      GF_SMTP_HOST: ${GF_SMTP_HOST:-}
+      GF_SMTP_USER: ${GF_SMTP_USER:-}
+      GF_SMTP_PASSWORD: ${GF_SMTP_PASSWORD:-}
+      GF_SMTP_FROM_ADDRESS: ${GF_SMTP_FROM_ADDRESS:-}
+      GF_SMTP_FROM_NAME: ${GF_SMTP_FROM_NAME:-CCE Grafana Alerts}
+      GF_SMTP_SKIP_VERIFY: ${GF_SMTP_SKIP_VERIFY:-false}
+      GF_ALERT_EMAIL_ADDRESS: ${GF_ALERT_EMAIL_ADDRESS:?set GF_ALERT_EMAIL_ADDRESS in .env}
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - prometheus
     restart: unless-stopped

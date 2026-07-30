@@ -1,0 +1,42 @@
+apiVersion: 1
+
+# RI-63: wires alert delivery to an actual notifier — previously alert rules existed
+# (cce-pipeline-alerts.yaml) but had no contact point/policy, so nothing ever paged anyone
+# (see artifacts/rw/docs/MONITORING-ALERTING.md §3, "Alert delivery is not yet wired").
+contactPoints:
+  - orgId: 1
+    name: cce-email-alerts
+    receivers:
+      - uid: cce-email-alerts-receiver
+        type: email
+        settings:
+          addresses: ${GF_ALERT_EMAIL_ADDRESS}
+          singleEmail: true
+          subject: '{{ if eq .Status "firing" }}CCE Alert{{ else }}CCE Alert Resolved{{ end }}: {{ .CommonLabels.alertname }}'
+          message: |
+            {{ range .Alerts }}
+            {{ if eq .Status "firing" }}An issue has been detected with the CCE data pipeline:{{ else }}This issue has been resolved — no action needed:{{ end }}
+
+            {{ .Annotations.summary }}
+
+            {{ if eq .Status "firing" }}Detected since: {{ .StartsAt.Format "Jan 02, 2006 15:04 MST" }}{{ else }}Resolved at: {{ .EndsAt.Format "Jan 02, 2006 15:04 MST" }}{{ end }}
+            {{ end }}
+            --------------------------------------------------
+            View in Grafana: {{ .ExternalURL }}
+
+            This is an automated alert from CCE Data Pipeline monitoring. Do not reply to this email.
+  # No-op receiver: the root policy's catch-all default. Any alert not explicitly matched by a
+  # route in policies.yaml lands here and produces no notification (empty receivers list) —
+  # used to scope email delivery to only the alerts we explicitly route to cce-email-alerts.
+  # Grafana's provisioning validator rejects a contact point with zero integrations — there's no
+  # native "silence" receiver. This webhook points at an intentionally-unreachable local address,
+  # so the other 4 pre-existing alerts (not yet wanted over email) produce no human-visible
+  # notification, at the cost of a harmless "notify failed" entry in Grafana's own alert log.
+  - orgId: 1
+    name: no-op
+    receivers:
+      - uid: no-op-receiver
+        type: webhook
+        settings:
+          url: http://127.0.0.1:1/no-op
+          httpMethod: POST
