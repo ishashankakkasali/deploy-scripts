@@ -165,15 +165,33 @@ spec:
                 configMapKeyRef:
                   name: cce-config
                   key: CCE_OPSALERT_TIER3_THRESHOLD_MINUTES
+            # Tier Cc — optional, safe to wire as a plain passthrough for all three tiers: every
+            # tier's app-level default is the same, empty (no built-in escalation chain — see
+            # that repo's api-reference.md for why that was deliberately removed), so an unset
+            # value here resolves to the exact same "no cc" the app would pick anyway. In
+            # cce-secrets, not cce-config, since a real value is people's email addresses.
+            - name: CCE_OPSALERT_TIER1_CC
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_OPSALERT_TIER1_CC
+            - name: CCE_OPSALERT_TIER2_CC
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_OPSALERT_TIER2_CC
+            - name: CCE_OPSALERT_TIER3_CC
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_OPSALERT_TIER3_CC
             # Still deliberately NOT wired: CCE_OPSALERT_POLL_INTERVAL_MS and each tier's
-            # _SUBJECT/_CC. Unlike threshold-minutes above, these DO still have an app-level
-            # `:default` (they're meant to stay optional — the app's own PRD-matching defaults
-            # are genuinely fine to fall back to), so a plain passthrough isn't safe for them the
-            # way it is for threshold-minutes: envsubst turns a genuinely-unset ${VAR} into an
-            # empty string rather than leaving it absent, and Spring only falls back to its own
-            # default when a property is entirely absent, not when it's present-but-empty. Wiring
-            # one needs a `:=` default added to deploy-uat.sh/deploy-prod.sh first, matching that
-            # app default, so envsubst never actually sees it unset.
+            # _SUBJECT. These still have a non-empty app-level default (the PRD's own copy) — a
+            # plain passthrough isn't safe for them: envsubst turns a genuinely-unset ${VAR} into
+            # an empty string rather than leaving it absent, and Spring only falls back to its
+            # own default when a property is entirely absent, not when it's present-but-empty.
+            # Wiring one needs a `:=` default added to deploy-uat.sh/deploy-prod.sh first,
+            # matching that app default, so envsubst never actually sees it unset.
             # Unused by the demo-rw branch's code today (no spring-kafka dependency) — kept
             # wired rather than removed, matching the other services here that do use it, so
             # nothing needs to change here if a Kafka dependency is ever reintroduced.

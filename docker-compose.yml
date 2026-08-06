@@ -541,13 +541,17 @@ services:
       CCE_OPSALERT_TIER1_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER1_THRESHOLD_MINUTES}
       CCE_OPSALERT_TIER2_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER2_THRESHOLD_MINUTES}
       CCE_OPSALERT_TIER3_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER3_THRESHOLD_MINUTES}
-      # Still deliberately NOT wired: CCE_OPSALERT_POLL_INTERVAL_MS and each tier's _SUBJECT/_CC.
-      # Unlike thresholds above, these are meant to stay optional — the app's own PRD-matching
-      # defaults are genuinely fine to fall back to for these, so there's no "required" version
-      # of them the way there is above. Wiring them still needs a `${VAR:-default}` matching the
-      # app's own default value, not a bare passthrough: an unset ${VAR} with no default resolves
-      # to an empty string, which Spring binds literally instead of falling back, and for _CC
-      # specifically would silently replace the escalation-chain default with "no cc".
+      # Optional — every tier's app-level default is the same, empty (no built-in escalation
+      # chain — see that repo's api-reference.md for why that was deliberately removed), so a
+      # plain passthrough is safe for all three: an unset value resolves to the same "no cc" the
+      # app would pick anyway. Comma-separated for more than one address per tier.
+      CCE_OPSALERT_TIER1_CC: ${CCE_OPSALERT_TIER1_CC:-}
+      CCE_OPSALERT_TIER2_CC: ${CCE_OPSALERT_TIER2_CC:-}
+      CCE_OPSALERT_TIER3_CC: ${CCE_OPSALERT_TIER3_CC:-}
+      # Still deliberately NOT wired: CCE_OPSALERT_POLL_INTERVAL_MS and each tier's _SUBJECT.
+      # These still have a non-empty app-level default (the PRD's own copy) — a bare passthrough
+      # isn't safe for them: an unset ${VAR} with no default resolves to an empty string, which
+      # Spring binds literally instead of falling back to that copy.
       # Observability
       MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus,metrics
       MANAGEMENT_METRICS_TAGS_APPLICATION: cce-intelligence-service

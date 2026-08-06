@@ -86,6 +86,11 @@ secretGenerator:
       - CCE_INTELLIGENCE_ALERT_NAME_TIER2=${CCE_INTELLIGENCE_ALERT_NAME_TIER2}
       - CCE_INTELLIGENCE_ALERT_EMAIL_TIER3=${CCE_INTELLIGENCE_ALERT_EMAIL_TIER3}
       - CCE_INTELLIGENCE_ALERT_NAME_TIER3=${CCE_INTELLIGENCE_ALERT_NAME_TIER3}
+      # Tier Cc — optional, comma-separated for more than one address per tier. Safe as a plain
+      # passthrough for all three: every tier's app-level default is the same, empty.
+      - CCE_OPSALERT_TIER1_CC=${CCE_OPSALERT_TIER1_CC}
+      - CCE_OPSALERT_TIER2_CC=${CCE_OPSALERT_TIER2_CC}
+      - CCE_OPSALERT_TIER3_CC=${CCE_OPSALERT_TIER3_CC}
 
 generatorOptions:
   disableNameSuffixHash: true
