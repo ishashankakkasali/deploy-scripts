@@ -18,6 +18,14 @@ spec:
     spec:
       containers:
         - name: cce-intelligence-service
+          # RI-63: deploys the demo-rw branch's build — a minimal, fresh service scoped to the
+          # ops-alerting engine only (that repo's docs/architecture-overview.md). No clinical
+          # FHIR pipeline here, unlike the demo/main branch's image, and schema is Flyway-managed
+          # (that repo owns real migrations), not Hibernate `ddl-auto`. KAFKA_BOOTSTRAP_SERVERS
+          # below is currently unused (no spring-kafka dependency on this branch) but kept wired.
+          # Image tag below is an inert placeholder — the real deployed image is set by a manual
+          # digest-based redeploy step outside this repo, not by this tag or kustomize's images:
+          # transformer in the overlays.
           image: ghcr.io/openphc/cce-intelligence-service:release-1.0.0
           ports:
             - containerPort: 8085
@@ -55,12 +63,120 @@ spec:
               value: "10"
             - name: DB_POOL_MIN_IDLE
               value: "5"
-            # Schema managed by Hibernate (consistent with cce-compliance-service in k8s),
-            # which sidesteps the Flyway baseline race on a shared public schema.
-            - name: SPRING_FLYWAY_ENABLED
-              value: "false"
-            - name: SPRING_JPA_HIBERNATE_DDL_AUTO
-              value: "update"
+            # Flyway — this service's own migration, isolated from every other service sharing
+            # this Postgres by a distinct history table name (that repo's V1 migration comment
+            # explains why: without it, this service's V1 would collide with whichever other
+            # service's V1 already occupies the default `flyway_schema_history` name).
+            - name: SPRING_FLYWAY_TABLE
+              value: "flyway_schema_history_intelligence"
+            - name: SPRING_FLYWAY_BASELINE_ON_MIGRATE
+              value: "true"
+            - name: SPRING_FLYWAY_BASELINE_VERSION
+              value: "0"
+            # SMTP — timeouts are load-bearing, not just tidy: a hung SMTP call would otherwise
+            # hold the row lock (and DB connection) that makes concurrent replicas safe open
+            # indefinitely (that repo's docs/flow-diagrams.md).
+            - name: SPRING_MAIL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: cce-config
+                  key: CCE_INTELLIGENCE_SMTP_HOST
+            - name: SPRING_MAIL_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: cce-config
+                  key: CCE_INTELLIGENCE_SMTP_PORT
+            - name: SPRING_MAIL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_SMTP_USERNAME
+            - name: SPRING_MAIL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_SMTP_PASSWORD
+            - name: SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH
+              value: "true"
+            - name: SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE
+              value: "true"
+            - name: SPRING_MAIL_PROPERTIES_MAIL_SMTP_CONNECTIONTIMEOUT
+              value: "5000"
+            - name: SPRING_MAIL_PROPERTIES_MAIL_SMTP_TIMEOUT
+              value: "5000"
+            - name: SPRING_MAIL_PROPERTIES_MAIL_SMTP_WRITETIMEOUT
+              value: "5000"
+            # Tier recipients — named by tier position, not by whoever currently holds it, so a
+            # future name/role change is a Secret value change here, never a rebuild (that
+            # repo's docs/api-reference.md). Required, no default — the service fails to start
+            # with a clear error naming whichever is missing. Each accepts one address or a
+            # comma-separated list.
+            - name: ALERT_EMAIL_TIER1
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_EMAIL_TIER1
+            - name: ALERT_NAME_TIER1
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_NAME_TIER1
+            - name: ALERT_EMAIL_TIER2
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_EMAIL_TIER2
+            - name: ALERT_NAME_TIER2
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_NAME_TIER2
+            - name: ALERT_EMAIL_TIER3
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_EMAIL_TIER3
+            - name: ALERT_NAME_TIER3
+              valueFrom:
+                secretKeyRef:
+                  name: cce-secrets
+                  key: CCE_INTELLIGENCE_ALERT_NAME_TIER3
+            # Escalation-timing — required, no default (unlike _SUBJECT/_CC/POLL_INTERVAL below,
+            # which stay optional), sourced exactly like the recipients above: a plain
+            # configMapKeyRef, no extra validation in this repo. A missing one isn't caught here
+            # — it's caught by the app itself the moment the pod starts. Unlike the recipients
+            # (String fields, which need TierConfig's own explicit check because Spring accepts
+            # any string without complaint), threshold-minutes is a `long` — Spring's own numeric
+            # binding already rejects a missing/blank value with its own clear error naming the
+            # exact property, value, and YAML line, no custom validation code needed on either
+            # side (see that repo's api-reference.md). Set in Infisical.
+            - name: CCE_OPSALERT_TIER1_THRESHOLD_MINUTES
+              valueFrom:
+                configMapKeyRef:
+                  name: cce-config
+                  key: CCE_OPSALERT_TIER1_THRESHOLD_MINUTES
+            - name: CCE_OPSALERT_TIER2_THRESHOLD_MINUTES
+              valueFrom:
+                configMapKeyRef:
+                  name: cce-config
+                  key: CCE_OPSALERT_TIER2_THRESHOLD_MINUTES
+            - name: CCE_OPSALERT_TIER3_THRESHOLD_MINUTES
+              valueFrom:
+                configMapKeyRef:
+                  name: cce-config
+                  key: CCE_OPSALERT_TIER3_THRESHOLD_MINUTES
+            # Still deliberately NOT wired: CCE_OPSALERT_POLL_INTERVAL_MS and each tier's
+            # _SUBJECT/_CC. Unlike threshold-minutes above, these DO still have an app-level
+            # `:default` (they're meant to stay optional — the app's own PRD-matching defaults
+            # are genuinely fine to fall back to), so a plain passthrough isn't safe for them the
+            # way it is for threshold-minutes: envsubst turns a genuinely-unset ${VAR} into an
+            # empty string rather than leaving it absent, and Spring only falls back to its own
+            # default when a property is entirely absent, not when it's present-but-empty. Wiring
+            # one needs a `:=` default added to deploy-uat.sh/deploy-prod.sh first, matching that
+            # app default, so envsubst never actually sees it unset.
+            # Unused by the demo-rw branch's code today (no spring-kafka dependency) — kept
+            # wired rather than removed, matching the other services here that do use it, so
+            # nothing needs to change here if a Kafka dependency is ever reintroduced.
             - name: KAFKA_BOOTSTRAP_SERVERS
               valueFrom:
                 configMapKeyRef:
