@@ -492,7 +492,11 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
       SERVER_PORT: 8085
-      # Database
+      # Database — shared ccedb, same credentials every other service here uses. This service
+      # only reads collector-service's inbound_event_log (IngestionGapEvaluator) in addition to
+      # owning its own notification_tracker table; there's no per-service DB user/grant
+      # mechanism in this stack today (every service already shares one admin Postgres user),
+      # so no additional grant is needed beyond what's already provisioned.
       DB_HOST: ${POSTGRES_DB_HOST:-cce-postgres}
       DB_PORT: ${POSTGRES_DB_PORT:-5432}
       DB_NAME: ${POSTGRES_DB:-ccedb}
@@ -506,6 +510,48 @@ services:
       SPRING_FLYWAY_BASELINE_VERSION: "0"
       # Kafka
       KAFKA_BOOTSTRAP_SERVERS: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # SMTP — real transactional-email provider in a real deployment; Gmail + App Password
+      # works for non-production testing (see that repo's docs/developer-setup.md). Timeouts
+      # are load-bearing, not just tidy: a hung SMTP call would otherwise hold the row lock (and
+      # DB connection) that makes concurrent replicas safe open indefinitely (flow-diagrams.md).
+      SPRING_MAIL_HOST: ${CCE_INTELLIGENCE_SMTP_HOST:-smtp.gmail.com}
+      SPRING_MAIL_PORT: ${CCE_INTELLIGENCE_SMTP_PORT:-587}
+      SPRING_MAIL_USERNAME: ${CCE_INTELLIGENCE_SMTP_USERNAME}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: "true"
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: "true"
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_CONNECTIONTIMEOUT: 5000
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_TIMEOUT: 5000
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_WRITETIMEOUT: 5000
+      SPRING_MAIL_PASSWORD: ${CCE_INTELLIGENCE_SMTP_PASSWORD}
+      # Tier recipients — named by tier position, not by whoever currently holds it, so a future
+      # name/role change is a value change here, never a rebuild (that repo's api-reference.md).
+      # Required, no default — startup fails with a clear error naming whichever is missing.
+      # Each accepts one address or a comma-separated list.
+      ALERT_EMAIL_TIER1: ${CCE_INTELLIGENCE_ALERT_EMAIL_TIER1}
+      ALERT_NAME_TIER1: ${CCE_INTELLIGENCE_ALERT_NAME_TIER1}
+      ALERT_EMAIL_TIER2: ${CCE_INTELLIGENCE_ALERT_EMAIL_TIER2}
+      ALERT_NAME_TIER2: ${CCE_INTELLIGENCE_ALERT_NAME_TIER2}
+      ALERT_EMAIL_TIER3: ${CCE_INTELLIGENCE_ALERT_EMAIL_TIER3}
+      ALERT_NAME_TIER3: ${CCE_INTELLIGENCE_ALERT_NAME_TIER3}
+      # Escalation-timing — required, no default, wired exactly like ALERT_EMAIL_TIER*/
+      # ALERT_NAME_TIER* above (plain passthrough, no ${VAR:?...}) rather than validated here
+      # too: a `long` field, so Spring's own numeric binding already rejects a missing/blank
+      # value with its own clear error naming the exact property, value, and YAML line — no
+      # need to duplicate that check in this file (see that repo's api-reference.md).
+      CCE_OPSALERT_TIER1_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER1_THRESHOLD_MINUTES}
+      CCE_OPSALERT_TIER2_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER2_THRESHOLD_MINUTES}
+      CCE_OPSALERT_TIER3_THRESHOLD_MINUTES: ${CCE_OPSALERT_TIER3_THRESHOLD_MINUTES}
+      # Optional — every tier's app-level default is the same, empty (no built-in escalation
+      # chain — see that repo's api-reference.md for why that was deliberately removed), so a
+      # plain passthrough is safe for all three: an unset value resolves to the same "no cc" the
+      # app would pick anyway. Comma-separated for more than one address per tier.
+      CCE_OPSALERT_TIER1_CC: ${CCE_OPSALERT_TIER1_CC:-}
+      CCE_OPSALERT_TIER2_CC: ${CCE_OPSALERT_TIER2_CC:-}
+      CCE_OPSALERT_TIER3_CC: ${CCE_OPSALERT_TIER3_CC:-}
+      # Still deliberately NOT wired: CCE_OPSALERT_POLL_INTERVAL_MS and each tier's _SUBJECT.
+      # These still have a non-empty app-level default (the PRD's own copy) — a bare passthrough
+      # isn't safe for them: an unset ${VAR} with no default resolves to an empty string, which
+      # Spring binds literally instead of falling back to that copy.
       # Observability
       MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus,metrics
       MANAGEMENT_METRICS_TAGS_APPLICATION: cce-intelligence-service

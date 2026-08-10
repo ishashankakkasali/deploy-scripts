@@ -45,6 +45,17 @@ configMapGenerator:
       - ALLOWED_ORIGINS=${GATEWAY_ALLOWED_ORIGINS}
       - BASIC_AUTH_ENABLED=${BASIC_AUTH_ENABLED}
       - BASIC_AUTH_CLIENT_ID=${BASIC_AUTH_CLIENT_ID}
+      # cce-intelligence-service (RI-63) — SMTP host/port only; credentials and recipients are
+      # in cce-secrets below since they identify real people. Set in Infisical.
+      - CCE_INTELLIGENCE_SMTP_HOST=${CCE_INTELLIGENCE_SMTP_HOST}
+      - CCE_INTELLIGENCE_SMTP_PORT=${CCE_INTELLIGENCE_SMTP_PORT}
+      # Escalation-timing — required, no default, wired as a plain passthrough like the
+      # recipients in cce-secrets below: a missing one isn't checked here (deploy-uat.sh's
+      # comment on this explains why), it fails with a precise error from the app itself once
+      # the pod starts (Spring's own numeric binding for these). Set in Infisical.
+      - CCE_OPSALERT_TIER1_THRESHOLD_MINUTES=${CCE_OPSALERT_TIER1_THRESHOLD_MINUTES}
+      - CCE_OPSALERT_TIER2_THRESHOLD_MINUTES=${CCE_OPSALERT_TIER2_THRESHOLD_MINUTES}
+      - CCE_OPSALERT_TIER3_THRESHOLD_MINUTES=${CCE_OPSALERT_TIER3_THRESHOLD_MINUTES}
 
 secretGenerator:
   - name: cce-secrets
@@ -63,6 +74,23 @@ secretGenerator:
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - BASIC_AUTH_CLIENT_SECRET=${BASIC_AUTH_CLIENT_SECRET}
+      # cce-intelligence-service (RI-63) — SMTP credentials + tier recipients. Recipients are
+      # here rather than in cce-config since they're real people's names/addresses, not
+      # structural config. Required, no default on the app side — a missing one fails that
+      # pod's startup with a clear error naming exactly which. Set in Infisical.
+      - CCE_INTELLIGENCE_SMTP_USERNAME=${CCE_INTELLIGENCE_SMTP_USERNAME}
+      - CCE_INTELLIGENCE_SMTP_PASSWORD=${CCE_INTELLIGENCE_SMTP_PASSWORD}
+      - CCE_INTELLIGENCE_ALERT_EMAIL_TIER1=${CCE_INTELLIGENCE_ALERT_EMAIL_TIER1}
+      - CCE_INTELLIGENCE_ALERT_NAME_TIER1=${CCE_INTELLIGENCE_ALERT_NAME_TIER1}
+      - CCE_INTELLIGENCE_ALERT_EMAIL_TIER2=${CCE_INTELLIGENCE_ALERT_EMAIL_TIER2}
+      - CCE_INTELLIGENCE_ALERT_NAME_TIER2=${CCE_INTELLIGENCE_ALERT_NAME_TIER2}
+      - CCE_INTELLIGENCE_ALERT_EMAIL_TIER3=${CCE_INTELLIGENCE_ALERT_EMAIL_TIER3}
+      - CCE_INTELLIGENCE_ALERT_NAME_TIER3=${CCE_INTELLIGENCE_ALERT_NAME_TIER3}
+      # Tier Cc — optional, comma-separated for more than one address per tier. Safe as a plain
+      # passthrough for all three: every tier's app-level default is the same, empty.
+      - CCE_OPSALERT_TIER1_CC=${CCE_OPSALERT_TIER1_CC}
+      - CCE_OPSALERT_TIER2_CC=${CCE_OPSALERT_TIER2_CC}
+      - CCE_OPSALERT_TIER3_CC=${CCE_OPSALERT_TIER3_CC}
 
 generatorOptions:
   disableNameSuffixHash: true
