@@ -204,6 +204,13 @@ spec:
               value: "health,info,prometheus,metrics"
             - name: MANAGEMENT_METRICS_TAGS_APPLICATION
               value: "cce-intelligence-service"
+            # Spring Boot's mail health indicator opens a live SMTP connection to Office365 on
+            # every /actuator/health call — k8s probes hit that every ~10-15s, so it was taking
+            # the whole liveness/readiness check down whenever that connection was slow, causing
+            # kubelet to kill an otherwise-healthy pod. SMTP reachability isn't "is this pod
+            # alive" — AlertEscalationEngine already retries a failed send on its own next tick.
+            - name: MANAGEMENT_HEALTH_MAIL_ENABLED
+              value: "false"
           resources:
             requests:
               memory: 256Mi
