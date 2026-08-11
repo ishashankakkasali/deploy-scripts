@@ -29,17 +29,14 @@ body {
   width: 40px;
   height: 40px;
   min-width: 40px;
-  background: #ffffff;
-  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
 }
 
 .gov-bar-icon img {
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   object-fit: contain;
 }
 
