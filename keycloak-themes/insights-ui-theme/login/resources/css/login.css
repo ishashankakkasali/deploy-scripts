@@ -29,17 +29,14 @@ body {
   width: 40px;
   height: 40px;
   min-width: 40px;
-  background: #ffffff;
-  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
 }
 
 .gov-bar-icon img {
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   object-fit: contain;
 }
 
@@ -50,13 +47,15 @@ body {
 }
 
 .gov-bar-text span {
-  font-size: 13px;
-  color: #dbeafe;
+  font-size: 16px;
+  font-weight: 700;
+  color: #ffffff;
 }
 
 .gov-bar-text strong {
-  font-size: 16px;
-  font-weight: 700;
+  font-size: 13px;
+  font-weight: 400;
+  color: #dbeafe;
 }
 
 .gov-bar-right {

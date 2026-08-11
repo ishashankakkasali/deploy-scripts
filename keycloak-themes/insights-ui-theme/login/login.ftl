@@ -10,7 +10,7 @@
     <div class="gov-bar">
         <div class="gov-bar-left">
             <div class="gov-bar-icon">
-                <img src="${url.resourcesPath}/img/rwanda-moh-logo-full.png" alt="Republic of Rwanda — Ministry of Health"/>
+                <img src="${url.resourcesPath}/img/rwanda-coat-of-arms.png" alt="Republic of Rwanda — Ministry of Health"/>
             </div>
             <div class="gov-bar-text">
                 <span>Republic of Rwanda</span>
