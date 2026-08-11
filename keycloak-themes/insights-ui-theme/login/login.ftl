@@ -24,7 +24,7 @@
         <div class="card">
 
             <div class="banner">
-                <img class="seal" src="${url.resourcesPath}/img/rwanda-coat-of-arms.png" alt="Republic of Rwanda — Ministry of Health"/>
+                <img class="seal" src="${url.resourcesPath}/img/rwanda-moh-logo-full.png" alt="Republic of Rwanda — Ministry of Health"/>
                 <h1>Care Coordination Engine</h1>
                 <p>National care coordination and data insights</p>
             </div>
