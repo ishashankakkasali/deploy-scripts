@@ -26,10 +26,11 @@
 #   replay-inbound-events.sh backfill-clickhouse     (also run by rebuild-clickhouse)
 #   replay-inbound-events.sh verify
 #   replay-inbound-events.sh report                  (before/after counts and reasons, as markdown)
-#   replay-inbound-events.sh drop-old-tables --yes   (once a rebuild is verified)
+#   replay-inbound-events.sh drop-old-tables --yes   (once a rebuild is verified and its report read)
 #   replay-inbound-events.sh revert   --yes          (undo: old tables back, ClickHouse rebuilt)
 #   replay-inbound-events.sh revert   --yes --no-start   (going back from an upgrade: tables only)
 #   replay-inbound-events.sh restore  --file <backup.dump> --yes
+#   replay-inbound-events.sh restore-database --file <backup.dump> --yes   (the whole database back; after A11 of an upgrade)
 #   replay-inbound-events.sh logs <service>
 #   replay-inbound-events.sh service stop|start|state <service>
 #
@@ -197,6 +198,8 @@ RESTORE_TABLES="${RESTORE_TABLES:-}"
 SCHEMA_ORDER="${SCHEMA_ORDER:-$SERVICES}"
 # Only CCE's own topics and consumer groups are emptied / reset: the Kafka broker is shared with other
 # applications on some servers, and their topics and groups must never be touched by a replay.
+# The collector: stopped by 'restore-database' while the database is replaced, then started again.
+COLLECTOR_SERVICE="${COLLECTOR_SERVICE:-cce-collector-service}"
 TOPIC_PATTERN="${TOPIC_PATTERN:-^cce\.}"
 GROUP_PATTERN="${GROUP_PATTERN:-^cce-}"
 # INSIGHTS_SERVICES: read ClickHouse, so 'rebuild-clickhouse' stops them while the database is dropped
@@ -205,13 +208,6 @@ GROUP_PATTERN="${GROUP_PATTERN:-^cce-}"
 # waits for that before leaving them stopped.
 INSIGHTS_SERVICES="${INSIGHTS_SERVICES-cce-insights-service cce-insights-ui}"
 CH_SETTLE_MINUTES="${CH_SETTLE_MINUTES:-30}"
-# PROTOCOL_UPDATES: PlanDefinition JSON files, each replacing the stored definition of the SAME url and
-# version (e.g. a 1.x protocol converted to the 2.0 relatedAction direction). A rebuild's 'prepare'
-# applies them once the protocol rows are back, and has Protocol rebuild their trigger index through
-# its API (PROTOCOL_API_URL, as seen from this host; PROTOCOL_SERVICE is started for it if stopped).
-PROTOCOL_UPDATES="${PROTOCOL_UPDATES-}"
-PROTOCOL_SERVICE="${PROTOCOL_SERVICE:-cce-protocol-service}"
-PROTOCOL_API_URL="${PROTOCOL_API_URL:-}"
 
 # Fixed: the replay's source topic and its dead-letter topic; the tables that are never touched
 # whatever is listed (the replay source, the collector's migration record, Keycloak's); the schema
@@ -766,10 +762,6 @@ cmd_check() {
   done
   missing=""; for v in $DROP_TABLES; do table_exists "$v" || missing="$missing $v"; done
   [ -z "$missing" ] && ok "every table in DROP_TABLES exists" || warn "not in the database (nothing to drop, the services create them):$missing"
-  if [ -n "$(words $PROTOCOL_UPDATES)" ]; then
-    if [ -z "$PROTOCOL_API_URL" ]; then warn "PROTOCOL_UPDATES is set but PROTOCOL_API_URL is not"; fail=1
-    else local pu; for pu in $(protocol_update_targets); do ok "protocol update: $(echo "$pu" | cut -d'|' -f2,3 | tr '|' ' ') from $(basename "${pu##*|}") (applied by prepare; index rebuilt via $PROTOCOL_API_URL)"; done; fi
-  fi
   [ "$fail" = 0 ] && ok "all components reachable" || die "Fix the WARN lines (in $CONFIG_FILE or the deployment) before replaying."
 }
 
@@ -814,9 +806,6 @@ cmd_plan() {
     else printf '  %-34s %8s rows\n' "$t" "$(table_rows "$t")"; fi
   done
   log "Every other table stays as it is, including: $(words $NEVER_TOUCHED)"
-  if [ -n "$(words $PROTOCOL_UPDATES)" ]; then
-    local pu; for pu in $(protocol_update_targets); do log "Protocol definition replaced (same version) before the events are sent, then its trigger index rebuilt: $(echo "$pu" | cut -d'|' -f2,3 | tr '|' ' ') from $(basename "${pu##*|}")"; done
-  fi
   log "Kafka topics emptied: $(words $(output_topics)) (prepare; $DLQ_TOPIC is saved to a file first), $INBOUND_TOPIC (publish), cce.public.* (rebuild-clickhouse)"
   if in_list notification_tracker "$DROP_TABLES" && table_exists notification_tracker; then
     n=$(sql_value "SELECT count(*) FROM notification_tracker WHERE status = 'ACTIVE'")
@@ -846,57 +835,8 @@ cmd_prepare() {
   require_no_foreign_inbound_readers
   # The numbers 'report' compares against, taken before anything changes.
   report_facts > "$STATE_DIR/report-before.tsv"; state_set prepare_started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  [ "$MODE" != rebuild ] || check_protocol_updates   # before anything changes
   local pt; pt=$(processed_table); state_set processed_table "$pt"
   if [ "$MODE" = fill-gaps ]; then prepare_fill_gaps; else prepare_rebuild; fi
-}
-
-# "id|url|version|file" for each PROTOCOL_UPDATES file; stops unless its url and version are stored.
-protocol_update_targets() {
-  local f uv id
-  for f in $PROTOCOL_UPDATES; do
-    [ -f "$f" ] || die "PROTOCOL_UPDATES: no file $f"
-    uv=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["url"] + "|" + d["version"])' "$f" 2>/dev/null) \
-      || die "PROTOCOL_UPDATES: $f is not a PlanDefinition JSON with url and version"
-    id=$(sql_value "SELECT id FROM protocol_definition WHERE url = '${uv%%|*}' AND version = '${uv#*|}'")
-    [ -n "$id" ] || die "PROTOCOL_UPDATES: $f is ${uv%%|*} version ${uv#*|}, which is not stored. An update keeps the stored url and version."
-    echo "$id|$uv|$f"
-  done
-}
-check_protocol_updates() {
-  [ -n "$(words $PROTOCOL_UPDATES)" ] || return 0
-  [ -n "$PROTOCOL_API_URL" ] || die "PROTOCOL_UPDATES is set but PROTOCOL_API_URL is not: Protocol's API rebuilds the trigger index. Nothing was changed."
-  protocol_update_targets >/dev/null
-}
-# Replace each stored definition from PROTOCOL_UPDATES (same url and version, so every enrolment keeps
-# pointing at it), then have Protocol rebuild its trigger index. Runs before the first event is sent.
-apply_protocol_updates() {
-  [ -n "$(words $PROTOCOL_UPDATES)" ] || return 0
-  local line id url version f json code before after started="" waited=0
-  log "Updating protocol definitions from PROTOCOL_UPDATES (same url and version), then rebuilding their trigger index"
-  for line in $(protocol_update_targets); do
-    IFS='|' read -r id url version f <<<"$line"
-    json=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))' "$f")
-    case "$json" in *'$pdef$'*) die "PROTOCOL_UPDATES: $f contains the text \$pdef\$";; esac
-    printf '%s\n' "UPDATE protocol_definition SET definition = \$pdef\$${json}\$pdef\$::jsonb, updated_at = now() WHERE id = '$id';" | psql_q >/dev/null
-    ok "$url $version: definition replaced from $(basename "$f")"
-  done
-  if [ "$(service_state "$PROTOCOL_SERVICE")" != running ]; then
-    log "Starting $PROTOCOL_SERVICE for the index rebuild"; services_start --no-wait "$PROTOCOL_SERVICE"; started=1
-  fi
-  until [ "$(curl -s -o /dev/null -w '%{http_code}' "$PROTOCOL_API_URL/actuator/health" 2>/dev/null || true)" = 200 ]; do
-    sleep 5; waited=$((waited + 5))
-    [ "$waited" -le "$SERVICE_START_TIMEOUT" ] || die "Protocol's API ($PROTOCOL_API_URL) did not answer within ${SERVICE_START_TIMEOUT}s. The definitions are replaced; run 'prepare' again after revert, or rebuild the index by hand: POST $PROTOCOL_API_URL/v1/protocol/protocol-definitions/<id>/rebuild-index"
-  done
-  for line in $(protocol_update_targets); do
-    IFS='|' read -r id url version f <<<"$line"
-    before=$(sql_value "SELECT count(*) FROM trigger_index WHERE protocol_definition_id = '$id'")
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROTOCOL_API_URL/v1/protocol/protocol-definitions/$id/rebuild-index" || true)
-    case "$code" in 2??) ;; *) die "rebuild-index for $url $version answered HTTP $code";; esac
-    after=$(sql_value "SELECT count(*) FROM trigger_index WHERE protocol_definition_id = '$id'")
-    ok "$url $version: trigger index rebuilt ($before -> $after rows)"
-  done
-  if [ -n "$started" ]; then log "Stopping $PROTOCOL_SERVICE again"; services_stop "$PROTOCOL_SERVICE"; require_stopped "$PROTOCOL_SERVICE"; fi
 }
 
 prepare_rebuild() {
@@ -943,7 +883,6 @@ prepare_rebuild() {
   empty_rebuilt_tables
   put_back_tables_not_created
   restore_rows
-  apply_protocol_updates
   state_set prepared rebuild
   ok "ready to publish. The cutoff is taken by 'publish': events received before it are replayed, later ones are live"
 }
@@ -1005,6 +944,15 @@ record_created_tables() {
   done
   state_set created "$(words $(state_get created) $new)"
   words $new
+}
+
+# Tables the services created that the old data never had (e.g. 2.0's matcher_event_log in a 1.x -> 2.0
+# upgrade): '' for a replay on the same release. Read from what 'prepare' recorded, so it also holds
+# when 'prepare' stopped partway.
+new_release_tables() {
+  local t out=""
+  for t in $(state_get created); do in_list "$t" "$(state_get moved)" || out="$out $t"; done
+  words $out
 }
 
 own_ledger() {   # cce-protocol-service -> flyway_schema_history_protocol (same rule as service_ledgers)
@@ -1232,7 +1180,7 @@ cmd_wait() {
   [ -n "$published" ] || die "Nothing published yet. Run the 'publish' step first."
   [ "$published" != "started, not finished" ] || die "The last publish did not finish, so some events may be missing. Rebuild: 'revert --yes', then start again from 'backup'. Fill-gaps: run 'prepare --mode fill-gaps --yes' again 10 minutes from now, then 'publish'."
   log "Waiting for $first to process everything (checks every 15 s; Ctrl-C is safe, re-run to keep watching)"
-  local stable=0 lag processed="" progress_sql=""
+  local stable=0 lag processed="" progress_sql="" s
   [ -n "$pt" ] && column_exists "$pt" received_at \
     && progress_sql="SELECT count(*) FROM $pt WHERE received_at >= '$(state_get published_at)'::timestamptz"
   while :; do
@@ -1241,6 +1189,12 @@ cmd_wait() {
     log "  lag=$lag${progress_sql:+   recorded in $pt since publishing began=$processed} (published $published)   WAL kept for CDC=$(slot_wal_kept)"
     if [ "$lag" = 0 ]; then stable=$((stable + 1)); [ "$stable" -ge 4 ] && break; else stable=0; fi
     [ "$(service_state "$first")" != stopped ] || die "$first is not running."
+    # The other services start only in 'finish'. One started by hand (or by a re-applied manifest) while
+    # the history is being processed acts on it half-done: e.g. the deadline service judges steps whose
+    # completing event is still in the topic, and records false OVERDUE / MISSED deviations.
+    for s in $(other_services); do
+      [ "$(service_state "$s")" != running ] || die "$s was started during the replay: it may be acting on a half-processed history (e.g. judging deadlines before their completing events are processed). Revert ('revert --yes'), then start again from 'prepare'."
+    done
     sleep 15
   done
   ok "$first has caught up (lag 0 for a minute). $DLQ_TOPIC now holds $(topic_record_count "$DLQ_TOPIC") records."
@@ -1248,7 +1202,11 @@ cmd_wait() {
 
 cmd_finish() {
   require_yes
-  local cg s mode n; cg=$(consumer_group); mode=$(state_get mode)
+  local cg s mode n published; cg=$(consumer_group); mode=$(state_get mode); published=$(state_get published)
+  # Publishing must be over: in fill-gaps the first service consumes while 'publish' sends, so its lag
+  # can read 0 between batches with part of the history still to come.
+  [ -n "$published" ] || die "Nothing published yet. Run the 'publish' step first."
+  [ "$published" != "started, not finished" ] || die "'publish' has not finished (or failed): events may still be on their way. Let it finish, then run 'wait' until it reports caught up."
   [ "$(group_lag "$cg" "$INBOUND_TOPIC")" = 0 ] || die "$cg still has lag — run the 'wait' step until it reports caught up."
   for s in $(other_services); do [ "$(service_state "$s")" != running ] || die "$s is running; it may already have acted on what the replayed events produced."; done
   log "Discarding what the replayed events produced for the other services, so nothing is sent again"
@@ -1400,11 +1358,11 @@ PY
 }
 
 # The daily compliance KPIs (mv_daily_compliance_kpis) are a snapshot the view takes of TODAY only, so a
-# rebuilt ClickHouse has no past days for them. schema/09 rebuilds past days from the history tables
-# (the other daily KPIs rebuild themselves from the clinical event time — see schema/09's header).
-# Run after every ClickHouse rebuild: with the original history (a ClickHouse-only rebuild, or after
-# 'revert') it restores every past day; right after a replay the history carries the replay's date,
-# so it only rewrites today's row (the same one the view writes) — harmless.
+# rebuilt ClickHouse has no past days for them. schema/09 refills the current-state rollups (the view
+# reads them), then rebuilds every past day from the base tables' clinical and deadline times
+# (enrolled_at, completed_at, the SLA thresholds), which a replay does not move (the other daily KPIs
+# rebuild themselves from the clinical event time — see schema/09's header). Run after every ClickHouse
+# rebuild; safe to repeat.
 cmd_backfill_clickhouse() {
   local file="$DATA_PIPELINE_DIR/schema/09-historical-backfill.sql" from to
   [ -f "$file" ] || { warn "no $file in this data-pipeline: backfill skipped"; return 0; }
@@ -1494,7 +1452,7 @@ cmd_verify() {
   printf '  %-42s %s\n' "CDC connector" "$(connect_api GET "/connectors/$CONNECTOR/status" 2>/dev/null | grep -oE '"state":"[A-Z]+"' | tr '\n' ' ')"
   log "SERVICES"
   local s; for s in $SERVICES; do printf '  %-30s %s\n' "$s" "$(service_state "$s")"; done
-  if old_schema_exists; then log "Old tables are still kept in schema $OLD_SCHEMA. Once this result is good: drop-old-tables --yes"; fi
+  if old_schema_exists; then log "Old tables are still kept in schema $OLD_SCHEMA (Revert can go back to them). Next: 'report', then, once you won't go back: 'drop-old-tables --yes'"; fi
 }
 
 # The numbers the report compares, as "section|key|value" lines. Rows are read as JSON
@@ -1654,6 +1612,16 @@ cmd_restore() {
   require_yes; validate_settings
   [ -f "$RESTORE_FILE" ] || die "Give the backup to restore: --file $STATE_DIR/ccedb_before_replay_<time>.dump"
   [ "$(head -c 5 "$RESTORE_FILE")" = "PGDMP" ] || die "$RESTORE_FILE is not a pg_dump backup."
+  # After an upgrade, SERVICES are the new release: started on the old tables, their migrations would
+  # fail or change them. Going back to the old release is always tables only (as --no-start).
+  local new_tables; new_tables=$(new_release_tables)
+  if [ -n "$new_tables" ]; then
+    old_schema_exists || die "This replay was an upgrade (the services created tables the old data never had: $new_tables), and its old tables are gone (drop-old-tables). The old release's data can only come back with the whole database restored: 'restore-database --file $RESTORE_FILE --yes' (REPLAY-RUNBOOK.md part U, 'Going back to 1.x', 'After A11'). Nothing was changed."
+    if [ -z "$NO_START" ]; then
+      warn "this replay was an upgrade (the services created tables the old data never had: $new_tables): the tables go back as they were and SERVICES stay stopped, as with --no-start"
+      NO_START=1
+    fi
+  fi
   stop_and_clear_kafka
   if old_schema_exists; then put_old_tables_back; else restore_from_backup_file; fi
   if [ -n "$NO_START" ]; then
@@ -1737,6 +1705,70 @@ SQL
   ok "restored"
 }
 
+# The whole database back from a backup, keeping the events received since: the way back after an
+# upgrade's old tables are gone (drop-old-tables), where 'restore' would put old rows into new tables.
+# 'pg_restore --clean' is not enough there: the new release's tables are not in the backup and their
+# foreign keys block it. So the database is dropped and created again, as the backup has it.
+cmd_restore_database() {
+  require_yes; validate_settings
+  [ -f "$RESTORE_FILE" ] || die "Give the backup to restore: --file <backup.dump> (e.g. $STATE_DIR/ccedb_before_replay_<time>.dump)"
+  [ "$(head -c 5 "$RESTORE_FILE")" = "PGDMP" ] || die "$RESTORE_FILE is not a pg_dump backup."
+  local since owner saved n s stopped=""
+  # The backup's own creation time (pg_dump records it), as UTC.
+  since=$($PG_EXEC sh -c "$(pg_cmd pg_restore -l)" < "$RESTORE_FILE" 2>/dev/null | sed -n 's/^;[[:space:]]*Archive created at //p' | head -1)
+  [ -n "$since" ] || die "Could not read when $RESTORE_FILE was taken (pg_restore -l). Nothing was changed."
+  since=$(sql_value "SELECT to_char(timestamptz '$since' AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')") || die "Could not read the backup time '$since'. Nothing was changed."
+  owner=$(sql_value "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()")
+  log "Restoring the whole database $PG_DB from $RESTORE_FILE (taken $since UTC); events received since then are kept"
+
+  log "1/6 Stopping every CCE service that uses the database"
+  for s in $(reverse_services) $INSIGHTS_SERVICES $COLLECTOR_SERVICE; do
+    case "$(service_state "$s")" in absent|stopped) ;; *) stopped="$stopped $s";; esac
+  done
+  services_stop $stopped; ok "stopped:${stopped:- none was running}"
+
+  log "2/6 Keeping the events received since the backup"
+  mkdir -p "$STATE_DIR"; saved="$STATE_DIR/events-since-backup-$(date -u +%Y%m%d_%H%M%S).copy"
+  ( umask 077; printf '%s\n' "COPY (SELECT * FROM inbound_event_log WHERE received_at >= '$since'::timestamptz) TO STDOUT" | psql_q > "$saved" ) \
+    || die "Could not save the events received since the backup. Nothing was changed (the services are stopped: $(words $stopped))."
+  ok "$(grep -c '' "$saved") event(s) saved to $saved"
+
+  log "3/6 Emptying Kafka (what the current release processed must not be processed again on the restored data)"
+  stop_and_clear_kafka
+
+  log "4/6 Stopping the CDC connector and dropping its replication slot (ClickHouse is rebuilt afterwards)"
+  connect_api PUT "/connectors/$CONNECTOR/stop" >/dev/null 2>&1 || warn "could not stop $CONNECTOR (continuing)"
+  for _ in $(seq 1 20); do
+    [ "$(sql_value "SELECT count(*) FROM pg_replication_slots WHERE database = current_database() AND active")" = 0 ] && break; sleep 3
+  done
+  sql_value "SELECT count(pg_drop_replication_slot(slot_name)) FROM pg_replication_slots WHERE database = current_database()" >/dev/null \
+    || die "Could not drop the replication slot(s) of $PG_DB (still in use?). Nothing in the database was changed."
+  ok "connector stopped, slot dropped"
+
+  log "5/6 Dropping $PG_DB and creating it again from the backup"
+  $PG_EXEC sh -c "$(pg_cmd psql -d postgres -v ON_ERROR_STOP=1 -X -q)" <<SQL || die "Dropping and creating $PG_DB failed (the user needs to be allowed to; see the error above). The events are saved in $saved."
+DROP DATABASE "$PG_DB" WITH (FORCE);
+CREATE DATABASE "$PG_DB" OWNER "$owner";
+SQL
+  $PG_EXEC sh -c "$(pg_cmd pg_restore -d "$PG_DB" --no-owner)" < "$RESTORE_FILE" \
+    || die "pg_restore reported errors (above). The events received since the backup are saved in $saved."
+  ok "$PG_DB is as it was at $since UTC"
+
+  log "6/6 Putting back the events received since the backup (those the backup already has are skipped)"
+  n=$({ echo "CREATE TEMP TABLE saved_events (LIKE inbound_event_log);"
+        echo "COPY saved_events FROM STDIN;"; cat "$saved"; printf '%s\n' '\.'
+        echo "WITH added AS (INSERT INTO inbound_event_log SELECT * FROM saved_events ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) FROM added;"
+      } | psql_q | tail -1) || die "Putting the saved events back failed. They are in $saved."
+  ok "$n event(s) added back"
+
+  services_start $COLLECTOR_SERVICE
+  state_set mode ""; state_set cutoff ""; state_set published ""; state_set moved ""; state_set created ""; state_set prepared ""
+  ok "done. The collector runs again; every other service is stopped."
+  printf '\n  Next (REPLAY-RUNBOOK.md, part U, "Going back to 1.x", steps 2-5): remove the new services, deploy\n'
+  printf '  and start the old ones, rebuild ClickHouse with the old data-pipeline, then fill-gaps\n'
+  printf "  with --from '%s'.\n\n" "$since"
+}
+
 cmd_drop_old_tables() {   # after a verified rebuild: delete the old copies for good
   require_yes
   old_schema_exists || die "There is no schema $OLD_SCHEMA: nothing to drop."
@@ -1744,7 +1776,8 @@ cmd_drop_old_tables() {   # after a verified rebuild: delete the old copies for 
     || die "No finished replay recorded after the rebuild. Finish and verify it first, or undo with 'revert --yes'."
   log "Deleting the old tables kept in schema $OLD_SCHEMA: $(sql_value "SELECT string_agg(tablename, ' ') FROM pg_tables WHERE schemaname = '$OLD_SCHEMA'")"
   sql_value "DROP SCHEMA $OLD_SCHEMA CASCADE" >/dev/null
-  ok "dropped. 'revert' can no longer go back to before this replay (the backup file still can, with 'restore')."
+    if [ -n "$(new_release_tables)" ]; then ok "dropped. 'revert' can no longer go back to before this upgrade; only 'restore-database --file <backup> --yes' can (REPLAY-RUNBOOK.md part U, 'Going back to 1.x', 'After A11')."
+  else ok "dropped. 'revert' can no longer go back to before this replay (the backup file still can, with 'restore')."; fi
 }
 
 cmd_revert() {   # undo a replay: old tables back (or the backup's rows), ClickHouse rebuilt
@@ -1776,6 +1809,6 @@ case "$COMMAND" in
   check) cmd_check;;  status) cmd_status;;  plan) cmd_plan;;  backup) cmd_backup;;  prepare) cmd_prepare;;
   publish) cmd_publish;;  wait) cmd_wait;;  finish) cmd_finish;;
   rebuild-clickhouse) cmd_rebuild_clickhouse;;  backfill-clickhouse) cmd_backfill_clickhouse || die "The backfill had failures (shown above). It changes nothing else and is safe to run again.";;  verify) cmd_verify;;  report) cmd_report;;  logs) cmd_logs;;  restore) cmd_restore;;
-  revert) cmd_revert;;  drop-old-tables) cmd_drop_old_tables;;  service) cmd_service;;
+  revert) cmd_revert;;  restore-database) cmd_restore_database;;  drop-old-tables) cmd_drop_old_tables;;  service) cmd_service;;
   *) usage; exit 1;;
 esac

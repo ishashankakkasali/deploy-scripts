@@ -24,7 +24,6 @@ Everything here uses `migrate-1x-to-2x.sh`, one command per step. It is separate
 | `migrate-1x-to-2x.sh` | the steps below |
 | `migration-local.env` | example settings; copy and adjust it |
 | `docker-compose.baseline-1.yml` | sets `CCE_FLYWAY_BASELINE_VERSION=1` on Protocol and Matcher; the last file in `COMPOSE_FILES` |
-| `../replay/protocol-conversion/` | (optional) a protocol converted to the 2.0 `relatedAction` direction, same version: `PROTOCOL_UPDATES` |
 
 State, the backup and the report go to `~/cce-migration/<NAME>/`.
 
@@ -37,7 +36,7 @@ State, the backup and the report go to `~/cce-migration/<NAME>/`.
 - A checkout of **cce-matcher-service** (for `migration/verify.sql`).
 - `docker`, `curl` and `python3` on the machine.
 - Your settings file, copied from `migration-local.env`. Check every value, especially `COMPOSE_DIR`,
-  `COMPOSE_FILES`, the container names and `PROTOCOL_UPDATES`.
+  `COMPOSE_FILES` and the container names.
 
 Run everything from the deploy-scripts folder:
 ```bash
@@ -61,7 +60,8 @@ services, and runs Matcher V2's three refusal checks plus the protocol direction
   (on the UAT copy: 184 steps);
 - check 4 shows each protocol's first step and the step its `relatedAction` names. `visit-encounter ->
   vitals-recording` means the first step names the **next** step: that's the 1.x direction, which 2.0
-  reads reversed and V2 doesn't convert. Set `PROTOCOL_UPDATES` to a converted file (M3).
+  reads reversed and V2 doesn't convert. The protocols must already be in the 2.0 form: that is
+  prepared outside this procedure.
 
 ## M2. Save the 1.x numbers, back up
 ```bash
@@ -78,15 +78,6 @@ Compliance and scheduler must be down: two versions writing `step_instance` acro
 it. The collector keeps running; events it accepts wait in the inbound topic for Matcher.
 
 **Check:** `OK removed: cce-compliance-service cce-scheduler-service`.
-
-Then, **optional** (only when `PROTOCOL_UPDATES` is set):
-```bash
-$M update-protocol --yes
-```
-It replaces the stored definition with the file's, keeping url and version, so every enrolment keeps
-pointing at it. It must run after M3 and before M7: only 2.0 may read the 2.0 `relatedAction`
-direction. **Check:** `OK <url> <version>: definition replaced from <file>`. With no
-`PROTOCOL_UPDATES` it prints `nothing to do`.
 
 ## M4. Resolve Matcher V2's check 3
 Only if M1's check 3 warned:
@@ -135,13 +126,6 @@ $M migrate --yes
 **Check:** `OK Protocol migrated (ledger 1, 2)`, `OK Matcher migrated (ledger 1, 2, 3, 4, 5, 6, 7) and
 running`, `OK Protocol running`. It is safe to run again: each service is restarted and Flyway has
 nothing left to apply.
-
-Then, **optional** (after `update-protocol`):
-```bash
-$M rebuild-index --yes
-```
-Protocol rebuilds the trigger index of the replaced definition through its API (`PROTOCOL_API_URL`).
-**Check:** `OK <url> <version>: trigger index rebuilt (<before> -> <after> rows)`.
 
 **If it goes wrong:** Matcher V2 names the problem (`Cannot …`) and the step stops. Restore the M2
 backup and start again.

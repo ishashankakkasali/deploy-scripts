@@ -16,7 +16,6 @@ There are two ways to upgrade a 1.x deployment's data to 2.0. Use the **replay**
 | `replay.env` | settings template, every setting explained |
 | `replay-local.env` | example: a plain replay on a laptop copy of UAT (1.x) |
 | `replay-local-upgrade.env` | example: the 1.x → 2.0 upgrade on a laptop copy of UAT |
-| `protocol-conversion/` | UAT's `emr-service-protocol` 1.0.0 as it is, converted to the 2.0 `relatedAction` direction (same version), and the conversion script. Set in `PROTOCOL_UPDATES` (optional) |
 
 ## `data-migration/`
 
@@ -24,7 +23,7 @@ There are two ways to upgrade a 1.x deployment's data to 2.0. Use the **replay**
 |---|---|
 | `migrate-1x-to-2x.sh` | the migration, one step per command |
 | `MIGRATION-TEST-RUNBOOK.md` | the test runbook |
-| `migration-local.env` | example settings (laptop, Docker Compose); uses `../replay/protocol-conversion/` |
+| `migration-local.env` | example settings (laptop, Docker Compose) |
 | `docker-compose.baseline-1.yml` | Flyway baseline 1 on Protocol and Matcher, added after your compose files |
 
 Both use the 2.0 data-pipeline in `data-pipeline/` at the deploy-scripts root to rebuild ClickHouse.

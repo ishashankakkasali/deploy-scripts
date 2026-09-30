@@ -11,11 +11,9 @@
 #   migrate-1x-to-2x.sh backup                 pg_dump of the database
 #   migrate-1x-to-2x.sh stop-1x --yes          stop and remove the 1.x services (compliance, scheduler)
 #   migrate-1x-to-2x.sh fix-orphans --yes      null step links to events that are nowhere (Matcher V2 check 3)
-#   migrate-1x-to-2x.sh update-protocol --yes  (optional) replace stored definitions from PROTOCOL_UPDATES, same version
 #   migrate-1x-to-2x.sh deploy-2x              create the 2.0 services, stopped, with Flyway baseline 1
 #   migrate-1x-to-2x.sh copy-offsets --yes     Matcher's consumer group starts where compliance stopped
 #   migrate-1x-to-2x.sh migrate --yes          Protocol V2, then Matcher V2-V7, then Protocol again
-#   migrate-1x-to-2x.sh rebuild-index --yes    (optional) Protocol rebuilds the trigger index of PROTOCOL_UPDATES' definitions
 #   migrate-1x-to-2x.sh verify-schema          Matcher's migration/verify.sql
 #   migrate-1x-to-2x.sh fix-history-ids --yes  identity history ids -> sequence-backed (else Step SLA cannot start)
 #   migrate-1x-to-2x.sh start --yes            start Step SLA (Matcher and Protocol already run)
@@ -45,7 +43,7 @@ while [ $# -gt 0 ]; do
     *) [ -z "$COMMAND" ] && COMMAND="$1" || die "One command at a time."; shift;;
   esac
 done
-[ -n "$COMMAND" ] || { sed -n '2,26p' "$0"; exit 1; }
+[ -n "$COMMAND" ] || { sed -n '2,25p' "$0"; exit 1; }
 [ -f "$CONFIG_FILE" ] || die "No settings file at $CONFIG_FILE."
 # shellcheck disable=SC1090
 . "$CONFIG_FILE"
@@ -74,11 +72,6 @@ CH_USER="${CH_USER:-${CLICKHOUSE_USER:-cce_pipeline}}"; CH_PASSWORD="${CH_PASSWO
 DATA_PIPELINE_DIR="${DATA_PIPELINE_DIR:?Set DATA_PIPELINE_DIR (the 2.0 data-pipeline)}"
 MATCHER_MIGRATION_DIR="${MATCHER_MIGRATION_DIR:?Set MATCHER_MIGRATION_DIR (cce-matcher-service/migration, for verify.sql)}"
 START_TIMEOUT="${START_TIMEOUT:-300}"
-# Optional: PlanDefinition JSON files, each replacing the stored definition of the SAME url and version
-# ('update-protocol', while 1.x is stopped), and Protocol's API to rebuild their trigger index
-# ('rebuild-index', once Protocol runs). Empty: both steps do nothing.
-PROTOCOL_UPDATES="${PROTOCOL_UPDATES-}"
-PROTOCOL_API_URL="${PROTOCOL_API_URL:-}"
 mkdir -p "$STATE_DIR"
 
 # ---- helpers -------------------------------------------------------------------------------------
@@ -212,51 +205,6 @@ cmd_fix_orphans() {
   sql "UPDATE step_instance s SET completed_by_event_id = NULL WHERE s.completed_by_event_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM compliance_event_log e WHERE e.id = s.completed_by_event_id)" >/dev/null
   ok "$n step links to missing events set to NULL (the steps stay completed); details in $STATE_DIR/orphans.txt"
-}
-
-protocol_update_targets() {   # "id|url|version|file" per PROTOCOL_UPDATES file; stops unless url+version are stored
-  local f uv id
-  for f in $PROTOCOL_UPDATES; do
-    [ -f "$f" ] || die "PROTOCOL_UPDATES: no file $f"
-    uv=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["url"] + "|" + d["version"])' "$f" 2>/dev/null) \
-      || die "PROTOCOL_UPDATES: $f is not a PlanDefinition JSON with url and version"
-    id=$(sql "SELECT id FROM protocol_definition WHERE url = '${uv%%|*}' AND version = '${uv#*|}'")
-    [ -n "$id" ] || die "PROTOCOL_UPDATES: $f is ${uv%%|*} version ${uv#*|}, which is not stored. An update keeps the stored url and version."
-    echo "$id|$uv|$f"
-  done
-}
-
-# Only a 2.0 service may read a definition converted to the 2.0 relatedAction direction (1.x reads it
-# the other way): run after 'stop-1x', before 'migrate'. Same url and version, so every enrolment keeps
-# pointing at it.
-cmd_update_protocol() {
-  need_yes
-  [ -n "$(words $PROTOCOL_UPDATES)" ] || { ok "no PROTOCOL_UPDATES: nothing to do"; return; }
-  local s; for s in $OLD_SERVICES; do [ "$(state "$s")" != running ] || die "$s is running: it reads protocol definitions the 1.x way. Run 'stop-1x' first."; done
-  local line id url version f json
-  for line in $(protocol_update_targets); do
-    IFS='|' read -r id url version f <<<"$line"
-    json=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))' "$f")
-    case "$json" in *'$pdef$'*) die "PROTOCOL_UPDATES: $f contains the text \$pdef\$";; esac
-    printf '%s\n' "UPDATE protocol_definition SET definition = \$pdef\$${json}\$pdef\$::jsonb, updated_at = now() WHERE id = '$id';" | psql_q >/dev/null
-    ok "$url $version: definition replaced from $(basename "$f") (trigger index: 'rebuild-index' after 'migrate')"
-  done
-}
-
-cmd_rebuild_index() {
-  need_yes
-  [ -n "$(words $PROTOCOL_UPDATES)" ] || { ok "no PROTOCOL_UPDATES: nothing to do"; return; }
-  [ -n "$PROTOCOL_API_URL" ] || die "Set PROTOCOL_API_URL (Protocol's API, as seen from this host)."
-  [ "$(state "$PROTOCOL")" = running ] || die "$PROTOCOL is not running: run 'migrate' first."
-  local line id url version f code before after
-  for line in $(protocol_update_targets); do
-    IFS='|' read -r id url version f <<<"$line"
-    before=$(sql "SELECT count(*) FROM trigger_index WHERE protocol_definition_id = '$id'")
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PROTOCOL_API_URL/v1/protocol/protocol-definitions/$id/rebuild-index" || true)
-    case "$code" in 2??) ;; *) die "rebuild-index for $url $version answered HTTP $code";; esac
-    after=$(sql "SELECT count(*) FROM trigger_index WHERE protocol_definition_id = '$id'")
-    ok "$url $version: trigger index rebuilt ($before -> $after rows)"
-  done
 }
 
 cmd_deploy_2x() {
@@ -491,7 +439,7 @@ PY
 
 case "$COMMAND" in
   check) cmd_check;; snapshot) cmd_snapshot;; backup) cmd_backup;; stop-1x) cmd_stop_1x;; fix-orphans) cmd_fix_orphans;;
-  update-protocol) cmd_update_protocol;; rebuild-index) cmd_rebuild_index;; deploy-2x) cmd_deploy_2x;; copy-offsets) cmd_copy_offsets;; migrate) cmd_migrate;; verify-schema) cmd_verify_schema;;
+  deploy-2x) cmd_deploy_2x;; copy-offsets) cmd_copy_offsets;; migrate) cmd_migrate;; verify-schema) cmd_verify_schema;;
   fix-history-ids) cmd_fix_history_ids;; start) cmd_start;; rebuild-clickhouse) cmd_rebuild_clickhouse;; verify) cmd_verify;; report) cmd_report;; status) cmd_status;;
-  *) sed -n '2,26p' "$0"; exit 1;;
+  *) sed -n '2,25p' "$0"; exit 1;;
 esac

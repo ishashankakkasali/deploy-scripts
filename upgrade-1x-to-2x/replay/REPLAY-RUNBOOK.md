@@ -31,12 +31,16 @@ wrong; **Revert** undoes a replay. Run the steps in order and copy each command 
 
 ## Pick the kind of replay
 
-| You want to… | Use | Changes existing data? |
-|---|---|---|
-| Rebuild **everything** from all stored events | **A. Full rebuild** | Yes: `DROP_TABLES` are dropped and rebuilt |
-| Rebuild everything, but only from events received **in a date range** | **B. Rebuild from a date range** | Yes: same as A; events outside the range are left out |
-| Process events that were **never processed**, in a date range | **C. Fill gaps** | No: only adds what is missing |
-| Move a **1.x deployment to 2.0** by rebuilding its data under 2.0 | **[U. Upgrade 1.x → 2.0](#u-upgrade-1x--20-by-replay)** (deploys 2.0 first, then A) | Yes: the 1.x tables are dropped and 2.0's built |
+| You want to… | Use | Existing data | Events before `--from` / from `--to` on | Order |
+|---|---|---|---|---|
+| Rebuild **everything** from all stored events (after a bug fix, or a redeployment on empty tables) | **A. Full rebuild** | dropped (`DROP_TABLES`) and rebuilt | no range: everything is rebuilt | kept, except live events that arrive during the seconds `publish` sends (listed, checked in A9: [Live events during the replay](#live-events-during-the-replay-where-the-order-can-overlap)) |
+| Rebuild, but keep **only** the events received in a range (e.g. leave out test events sent after a moment, or events before a date that are known to be bad) | **B. Rebuild from a date range** | dropped and rebuilt, as in A | **gone** from the rebuilt data, counted as `never processed`; only in the A3 backup (and in `replay_old` until A11) | kept, except live events that arrive during the seconds `publish` sends (listed, checked in A9: [Live events during the replay](#live-events-during-the-replay-where-the-order-can-overlap)) |
+| Process events that were **never processed** (after a Kafka or service outage) | **C. Fill gaps** | **kept**: only what is missing is added | **untouched**: still processed as before | **not kept** for a patient with a gap and later activity: the missing events are processed after newer ones |
+| Move a **1.x deployment to 2.0** by rebuilding its data under 2.0 | **[U. Upgrade 1.x → 2.0](#u-upgrade-1x--20-by-replay)** (deploys 2.0 first, then A) | the 1.x tables dropped and 2.0's built | no range | kept, except live events that arrive during the seconds `publish` sends (listed, checked in A9: [Live events during the replay](#live-events-during-the-replay-where-the-order-can-overlap)) |
+
+B is not a faster A on part of the data: what it leaves out is lost from the rebuilt data. And B
+followed by C for the left-out events is C, with C's order: to have the whole history, in order,
+run A.
 
 **Date ranges.** `plan` and `publish` take `--from` and `--to`, in UTC, on the time CCE *received*
 each event (`inbound_event_log.received_at`). `--from` is inclusive, `--to` exclusive, either can be
@@ -51,7 +55,7 @@ range in `plan` and `publish`.
    keep coming in").
 2. **Drops** `DROP_TABLES` together with those services' migration records (e.g.
    `flyway_schema_history_matcher`). They are moved, unchanged, into schema `replay_old`, where they
-   stay until step A10, so **Revert** can put them back exactly. Dropping (not emptying) is what lets
+   stay until step A11, so **Revert** can put them back exactly. Dropping (not emptying) is what lets
    the services' own migrations build the tables in the shape the deployed release expects, which is
    also what makes an upgrade by replay possible.
 3. **Clears CCE's output topics** (`cce.*` except `cce.events.inbound` and the CDC topics). The
@@ -174,7 +178,7 @@ but for a patient with both a gap and new activity the order is not guaranteed.
 A table in `DROP_TABLES` that no service creates again is put back as it was: with its data if it's
 in `RESTORE_TABLES`, otherwise empty. The exception is a table tied by a foreign key to an old table
 the services did create again. It belongs to the old data model, so it stays in `replay_old` with the
-tables it is tied to: **Revert** puts it back with them, A10 deletes it with them. (In the 1.x → 2.0
+tables it is tied to: **Revert** puts it back with them, A11 deletes it with them. (In the 1.x → 2.0
 upgrade that can be `compliance_event_log`, when 1.x `step_instance` points at it; on a database
 where it doesn't, `compliance_event_log` comes back empty like the other 1.x-only tables.)
 
@@ -214,7 +218,7 @@ List `RESTORE_TABLES` parents first (`protocol_definition` before `trigger_index
 can only be put back after the row it points at.
 
 **Upgrading 1.x → 2.0 by replay** (instead of the database migration): part **U** below. It swaps
-the services by hand first (remove 1.x, deploy 2.0 without starting it), then runs A0–A10 with the
+the services by hand first (remove 1.x, deploy 2.0 without starting it), then runs A0–A11 with the
 upgrade block of `replay.env`.
 
 ### Before a rebuild
@@ -550,7 +554,7 @@ RESTORE_TABLES="facility receiver_adaptor destination_adaptor_mapping notificati
 
 **A laptop, upgrade 1.x → 2.0** (`upgrade-1x-to-2x/replay/replay-local-upgrade.env`, for part **U** against a local
 copy of a 1.x database, e.g. a UAT dump). The first part is the laptop file's above; then the
-upgrade block (as in the UAT upgrade file), and the optional `PROTOCOL_UPDATES`. With containers
+upgrade block (as in the UAT upgrade file). With containers
 started by `docker run`, U3 and U4 use the **Docker (containers by name)** commands: `docker stop` /
 `docker rm` for 1.x, `docker create` for 2.0; with Compose, the Compose ones.
 
@@ -691,9 +695,6 @@ start the stopped services again.
   the deployed image doesn't create (e.g. the 1.x-only tables in an upgrade);
 - `OK <table>: N rows restored` for each of `RESTORE_TABLES`, where N is the count `plan` listed, e.g.
   `OK facility: 72 rows restored`;
-- only when `PROTOCOL_UPDATES` is set (optional): `OK <url> <version>: definition replaced from <file>`,
-  possibly `Starting cce-protocol-service for the index rebuild`, then
-  `OK <url> <version>: trigger index rebuilt (N -> M rows)` for each file;
 - finally `OK ready to publish. The cutoff is taken by 'publish' …`.
 
 Then `$R status` shows the services `stopped`, the rebuilt tables empty except `RESTORE_TABLES`,
@@ -758,7 +759,12 @@ e.g. `OK cce-matcher-service has caught up (lag 0 for a minute). cce.events.inbo
 - the dead-letter topic holds records: the service gave up on those events. A few can be looked at
   afterwards (A7 keeps them and saves a copy); many mean something is wrong: **Revert**. Events that
   point at a specific protocol instance (`actionid` + `protocolinstanceid`) end up there after a
-  rebuild: the instance they name no longer exists.
+  rebuild: the instance they name no longer exists;
+- `STOP <service> was started during the replay …`: only the first service may run until A7. A
+  deadline service started by hand (or by a re-applied manifest) judges steps whose completing event
+  is still in the topic, and records false OVERDUE / MISSED deviations that can't be told apart from
+  real ones. **Revert**, then start again from A4. Until A7, don't start, restart or re-deploy any
+  CCE service.
 
 ### A7. Finish: start the other services
 ```bash
@@ -773,8 +779,16 @@ dead-letter topic is kept: if it holds records, `finish` prints
 deviation count climbs: the deadline service's first run judges every deadline that has already
 passed, so a burst of OVERDUE / MISSED deviations is expected.
 
+It starts nothing, and stops, while `publish` hasn't finished, while the first service still has lag,
+or when one of the other services is already running. Run it only after A6 reports caught up: the
+deadline service judges each deadline against the steps as they are when it runs, so a step whose
+completing event hasn't been processed yet would get a false OVERDUE / MISSED, with a deviation.
+
 **If it goes wrong:** a service that doesn't start: `$R logs <name>`, then `$R service start <name>`
 once fixed (e.g. `$R logs cce-step-sla-service`, then `$R service start cce-step-sla-service`).
+`STOP … is running; it may already have acted on what the replayed events produced`: a service was
+started by hand (or by a re-applied manifest) during the replay, and its verdicts may be wrong.
+**Revert**, then start again from A4.
 
 ### A8. Rebuild ClickHouse (Insights data)
 ```bash
@@ -852,8 +866,22 @@ that showed the old data may need a hard refresh (Ctrl+Shift+R).
 
 **If it goes wrong:** **Revert**.
 
-### A10. Remove the old tables
-Once A9 is good, and not before:
+### A10. Write the report to share
+```bash
+$R report
+```
+Writes a markdown file comparing the numbers from just before A4 (`prepare` saved them) with now:
+events processed, rows per table, enrolments per protocol, steps by status and deadline verdict,
+deviations by type, processed events by result (e.g. `ZERO_MATCH`). It adds the likely reason for
+each difference and the errors the services logged during the replay. Changes nothing, and can be run again
+at any time after A9. Read it before A11: once the old tables are removed, **Revert** can no longer go
+back to them.
+
+**Check:** `OK report written: <STATE_DIR>/replay-report-<time>.md`. Paste the file as it is into a
+ticket, chat or doc.
+
+### A11. Remove the old tables
+Once A9 is good and the A10 report has been read, and not before:
 ```bash
 $R drop-old-tables --yes
 ```
@@ -865,28 +893,19 @@ Deletes schema `replay_old` with the old tables in it.
 tables; only the A3 backup file can (`restore --file`, under **Revert**). A new rebuild refuses to
 start while `replay_old` exists, so this step can't be skipped by accident.
 
-### A11. Write the report to share
-```bash
-$R report
-```
-Writes a markdown file comparing the numbers from just before A4 (`prepare` saved them) with now:
-events processed, rows per table, enrolments per protocol, steps by status and deadline verdict,
-deviations by type, processed events by result (e.g. `ZERO_MATCH`). It adds the likely reason for
-each difference and the errors the services logged during the replay. Changes nothing; run it any
-time after A9 (also after A10).
-
-**Check:** `OK report written: <STATE_DIR>/replay-report-<time>.md`. Paste the file as it is into a
-ticket, chat or doc.
-
 ---
 
 ## B. Rebuild from a date range
 
 Same as A, but only events **received in the range** are replayed. Everything received before
-`--from` (or from `--to` on) is **not** rebuilt: those enrolments and steps disappear. Use this only
-when that is the intention.
+`--from` (or from `--to` on) is **not** rebuilt: those enrolments and steps disappear from the data,
+and `verify` counts those events as `never processed`. Use this only when leaving them out is the
+intention (e.g. test events sent after a moment, or events before a date known to be bad). The order
+is kept as in A (the same seconds of `publish` excepted). Don't use C afterwards to put the left-out events back: they would be processed after
+newer ones. To keep everything, run A.
 
-Do A0, A1, A3 and A4 as they are. Then replace A2 and A5 with these (UTC; a time is optional, e.g.
+The dates are options of `plan` and `publish`, not settings: the settings file stays the same. Do
+A0, A1, A3 and A4 as they are. Then replace A2 and A5 with these (UTC; a time is optional, e.g.
 `'2026-09-01 06:00'`; either end can be left out):
 
 ```bash
@@ -896,7 +915,7 @@ $R plan --mode rebuild --from '2026-09-01' --to '2026-09-15'
 $R publish --from '2026-09-01' --to '2026-09-15'
 ```
 
-Then do A6 to A10 as they are, with the same checks. `--from` is inclusive, `--to` exclusive. In A9,
+Then do A6 to A11 as they are, with the same checks. `--from` is inclusive, `--to` exclusive. In A9,
 `accepted events never processed` then counts the events left out on purpose, and the step count is
 lower than in A1.
 
@@ -910,14 +929,21 @@ were sent after it.
 For events the collector accepted but that were never processed, for example after a Kafka problem.
 **Nothing is dropped**: only events with no record in the first service's processed-events table
 (`matcher_event_log` in 2.0, `compliance_event_log` in 1.x) are sent, so an event already processed
-is never processed twice. The first service keeps running; the others pause. ClickHouse needs no
-rebuild (normal CDC carries the changes). Because the first service keeps processing live events
+is never processed twice. Events outside the range, and everything already processed, are not
+touched. The first service keeps running; the others pause. ClickHouse needs no rebuild (normal CDC
+carries the changes).
+
+**The order is not kept** for a patient who has a missing event *and* later activity: the missing
+(older) event is processed after the newer ones already processed, so, for example, an ORDER_VIOLATION
+recorded back then stays. Use C for lost events when that is acceptable; when the order matters for
+those patients, run A instead. Because the first service keeps processing live events
 while the missing ones are sent, a patient with both a gap and new activity may have their older
 (missing) event handled after a newer one: see "Live events during the replay: where the order can
 overlap".
 
-Pick the range (UTC): `--from` is inclusive, `--to` exclusive; either can be left out. Use the
-**same** `--from` / `--to` in `plan` and `publish`.
+Pick the range (UTC): `--from` is inclusive, `--to` exclusive; either can be left out. They are
+options of `plan` and `publish`, not settings (the settings file stays the same). Use the **same**
+`--from` / `--to` in `plan` and `publish`, e.g. `--from '2026-09-20 06:00'` for a time.
 
 | Step | Command | Check |
 |---|---|---|
@@ -962,7 +988,7 @@ processed again by the 2.0 services, on a fresh 2.0 schema.
 | U2 | Remove 1.x | compliance, scheduler removed; collector keeps running |
 | U3 | Deploy 2.0, **without starting it** | Protocol, Matcher, Step SLA, intelligence, Insights: created, stopped |
 | U4 | `check` | |
-| U5 | The replay: **A1–A10** | the replay starts the 2.0 services itself, in order |
+| U5 | The replay: **A1–A11** | the replay starts the 2.0 services itself, in order |
 | U6 | Finish | Insights, gateway, clean-up |
 
 Why "without starting": started on the 1.x tables, the 2.0 migrations fail ("already exists") and
@@ -989,12 +1015,9 @@ moment (A4 to build its tables, A5 Matcher, A7 the rest).
    to insert in U6.
 7. **No open alert incidents** (`SELECT count(*) FROM notification_tracker WHERE status = 'ACTIVE'`
    must be 0; `plan` also warns).
-8. **Protocol definitions in the 2.0 direction** (only if a 1.x protocol still names each step's *next*
-   step in `relatedAction`; 2.0 reads it as the step it waits on). Convert it, keeping its url and
-   version (`upgrade-1x-to-2x/replay/protocol-conversion/convert-to-2x-direction.py`), and list the file in
-   `PROTOCOL_UPDATES` with `PROTOCOL_API_URL`. A4 then replaces the stored definition once the protocol
-   rows are back, before any event is sent, and has Protocol rebuild its trigger index. Leave
-   `PROTOCOL_UPDATES` empty when no definition changes.
+8. **Protocol definitions ready for 2.0.** The replay restores the stored definitions as they are
+   (`RESTORE_TABLES`) and doesn't change them. Any change a protocol needs for 2.0 is made before this
+   procedure, outside it.
 9. **Tell people:** no events are processed and Insights is down from U2 until A8. The collector keeps
    accepting events, so none are lost.
 
@@ -1038,21 +1061,21 @@ runs (U2); `… is not deployed here` means U3 is missing; `the data-pipeline ca
 database does not have` means `DATA_PIPELINE_DIR` is not the 2.0 pipeline (U1). `prepare` refuses on
 the first two, so nothing can be damaged.
 
-### U5. The replay: A1–A10
-Run A1 to A10 as written, with these differences:
+### U5. The replay: A1–A11
+Run A1 to A11 as written, with these differences:
 
 | Step | Expect |
 |---|---|
 | A1 | services `stopped`, lag `-` (Matcher has read nothing yet). Fine |
-| A4 | each 2.0 service `started; created: …` (Matcher's list includes `matcher_event_log`); `protocol_definition: N rows restored`; with `PROTOCOL_UPDATES` (U1 step 8): `definition replaced …` and `trigger index rebuilt …`; the 1.x-only tables `put back as they were … (emptied: …)`, or `compliance_event_log` `kept with them in replay_old` when 1.x `step_instance` points at it |
+| A4 | each 2.0 service `started; created: …` (Matcher's list includes `matcher_event_log`); `protocol_definition: N rows restored`; the 1.x-only tables `put back as they were … (emptied: …)`, or `compliance_event_log` `kept with them in replay_old` when 1.x `step_instance` points at it |
 | A8 | ends with `Insights not started` (it was created stopped): started in U6 |
 | A9 | counts are 2.0's, so they differ from A1 |
 
-If A4 stops, go back with `$R revert --yes --no-start` (never a plain `revert`), fix the cause and
-start again from A3.
+If A4 stops, go back with `$R revert --yes --no-start` (a plain `revert` recognises the upgrade and does
+the same), fix the cause and start again from A3.
 
-Run **A10** only once you're sure you won't go back. **A11** (`report`) shows what changed between 1.x
-and 2.0, with the reasons.
+**A10** (`report`) shows what changed between 1.x and 2.0, with the reasons. Run **A11** only once
+you're sure you won't go back.
 
 ### U6. Finish
 1. **Insights:** `$R service start cce-insights-service`, then `$R service start cce-insights-ui`;
@@ -1075,10 +1098,10 @@ and 2.0, with the reasons.
    docker exec kafka kafka-consumer-groups --bootstrap-server kafka:9092 --delete --group cce-scheduler-service
    ```
 
-### Going back to 1.x (before A10)
+### Going back to 1.x (before A11)
 1. `$R revert --yes --no-start`. It puts the 1.x tables back, with their migration records exactly
-   as they were, and starts nothing. **Never** a plain `revert` here: it would start 2.0 on the 1.x
-   tables.
+   as they were, and starts nothing. (A plain `revert` does the same: it sees that the services created
+   tables 1.x never had, says `this replay was an upgrade …`, and leaves `SERVICES` stopped.)
 2. Remove the 2.0 services: Compose `docker compose rm -sf cce-protocol-service cce-matcher-service cce-step-sla-service`,
    Kubernetes `$K delete deploy cce-protocol-service cce-matcher-service cce-step-sla-service`.
 3. Bring 1.x back with the tags from U1: compliance, scheduler, and the 1.x intelligence and Insights
@@ -1087,6 +1110,22 @@ and 2.0, with the reasons.
 4. Rebuild ClickHouse with the 1.x data-pipeline: a 1.x settings file with
    `DATA_PIPELINE_DIR=~/cce-1x/data-pipeline`, then `rebuild-clickhouse --yes` with it.
 5. Catch up with **C. Fill gaps** (1.x settings), `--from` = the backup time step 1 printed.
+
+**After A11** (the old tables are gone): `revert` stops (`… its old tables are gone …`) and changes
+nothing, because the 1.x data is only in the A3 backup. Restore the whole database from it instead of
+step 1:
+```bash
+$R restore-database --file <A3 backup file> --yes
+```
+It stops every CCE service (the collector too), saves the events received since the backup to a file
+in `STATE_DIR`, empties CCE's Kafka topics (so 1.x doesn't process again what 2.0 already did), stops
+the CDC connector and drops its slot, drops `ccedb` and creates it again from the backup, puts the
+saved events back (skipping those the backup has), and starts the collector again. Everything else
+stays stopped. The user in `PG_EXEC` must be allowed to drop and create the database.
+
+**Check:** `OK <n> event(s) saved`, `OK ccedb is as it was at <backup time> UTC`, `OK <n> event(s)
+added back`. Then steps 2–5 above, with `--from` = the backup time it printed. (A fill-gaps leaves out
+the last 10 minutes: for events received just before the restore, run it again 10 minutes later.)
 
 ---
 
@@ -1101,7 +1140,7 @@ from it. Use it when a step cannot be fixed, or when the end result is wrong.
 | C5 (fill-gaps prepare) | `$R service start <name>` for each stopped service (2.0: `cce-step-sla-service`, `cce-intelligence-service`) |
 | A4–A7, A9 (or C6–C9) | `$R revert --yes`, then catch up (below) |
 | A8 only | Postgres is fine: run `$R rebuild-clickhouse --yes` again; `revert` only if it keeps failing |
-| any step of **U** (the upgrade) | `$R revert --yes --no-start`, then "Going back to 1.x" in part U. A plain `revert` would start the 2.0 services on the 1.x tables |
+| any step of **U** (the upgrade) | `$R revert --yes --no-start`, then "Going back to 1.x" in part U. A plain `revert` also leaves the 2.0 services stopped: it recognises an upgrade by the tables the services created |
 
 ```bash
 $R revert --yes
@@ -1139,7 +1178,9 @@ earlier, fill-gaps leaves out the last 10 minutes; run it again later for those.
 `SERVICES` stopped, does not rebuild ClickHouse, and leaves the old migration records exactly as they
 were (no checksum is changed: the old release comes back and checks them against its own files). It
 is for going back from an upgrade (part U), where `SERVICES` are the new release and must not run on
-the old tables.
+the old tables. `revert` and `restore` switch to it by themselves when the replay was an upgrade: the
+services created tables the old data never had (e.g. `matcher_event_log`), and they print
+`this replay was an upgrade …`.
 
 **If revert itself stops:** fix what the STOP message says and run `revert --yes` again. Every part
 is safe to repeat. To restore from a specific backup file: `$R restore --file <backup file> --yes`,
@@ -1153,7 +1194,8 @@ Other commands that help:
 | `$R logs <service>` (e.g. `$R logs cce-matcher-service`) | the service's recent log (on Kubernetes: every pod's) |
 | `$R service state\|start\|stop <service>` (e.g. `$R service state cce-step-sla-service`) | one service, on any platform (`stop` waits until its process has exited) |
 | `$R status` | services, row counts, WAL kept for CDC, lag, DLQ, replay progress |
-| `$R report` | before/after counts with reasons, as markdown to share (A11) |
+| `$R report` | before/after counts with reasons, as markdown to share (A10) |
+| `$R restore-database --file <backup> --yes` | the whole database back from a backup, keeping the events received since (going back after A11 of an upgrade) |
 | `$R backfill-clickhouse` | past days of the daily compliance KPIs from the history (`schema/09`); run by A8, safe to repeat |
 
 ## Good to know
@@ -1200,13 +1242,13 @@ Other commands that help:
 | 3. Insert the data into the Kafka topic | A5 `publish` (takes the cutoff first) |
 | 4. Start the Matcher service (the first service) | A5 `publish` |
 | 5. Wait for the Kafka lag to clear | A6 `wait` |
-| — then | A7 `finish` (the other services), A8 ClickHouse, A9 checks, A10 cleanup |
+| — then | A7 `finish` (the other services), A8 ClickHouse, A9 checks, A10 report, A11 cleanup |
 
 ## Tested
 
 On 2026-09-29, on a laptop copy of the rw-uat (1.x) database with the 2.x images, Kafka 3.8,
 Debezium 3.0 and ClickHouse 26.3, all on Docker Compose, and live events arriving throughout:
-the 1.x → 2.0 upgrade (A0–A10), going back from a failed and from a finished upgrade
+the 1.x → 2.0 upgrade (A0–A11), going back from a failed and from a finished upgrade
 (`revert --no-start`), the upgrade again with `publish --to`, a 2.0 rebuild, `revert --yes`, and
 `fill-gaps --from`. Kubernetes and installed (non-container) Postgres/Kafka were not part of it: run
 UAT before prod.
